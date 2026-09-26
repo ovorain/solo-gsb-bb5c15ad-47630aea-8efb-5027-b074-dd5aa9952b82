@@ -29,6 +29,7 @@ import {
   type SandboxOp,
   type SandboxPreview,
 } from './sandbox';
+import { buildReadingPack, isReadingPackStale, type ReadingPack } from './readingpack';
 import { localStore, serverStore } from './storage';
 import { createSnapshot, sanitizeSnapshots } from './snapshot';
 import { createIssueBaseline, sanitizeIssueBaselines } from './issueBaseline';
@@ -70,6 +71,10 @@ interface Snapshot {
   sandbox: SandboxPreview | null;
   /** 预演生成后正文或歧义确认记录已变化：预演失效，禁止应用 */
   sandboxStale: boolean;
+  /** 引用阅读包（会话内临时产物，不持久化、不进入撤销历史） */
+  readingPack: ReadingPack | null;
+  /** 阅读包生成后正文或歧义确认记录已变化：失效，须重新生成，禁止复制旧结果 */
+  readingPackStale: boolean;
   canUndo: boolean;
   canRedo: boolean;
 }
@@ -96,6 +101,8 @@ export class AppStore {
   lastTermReplace: { replaced: number; stale: number } | null = null;
   /** 修订沙盒：当前预演（会话内临时数据，不持久化、不进入撤销历史） */
   private sandbox: SandboxPreview | null = null;
+  /** 引用阅读包：当前阅读包（会话内临时产物，不持久化、不进入撤销历史） */
+  private readingPack: ReadingPack | null = null;
   /** 正文版本号：仅当正文文档对象变化时递增（批注 / 规范规则 / 歧义确认不变更正文） */
   private docRevision = 0;
 
@@ -132,6 +139,10 @@ export class AppStore {
     termHits: this.termHits,
     sandbox: this.sandbox,
     sandboxStale: this.sandbox ? this.isSandboxStale(this.sandbox) : false,
+    readingPack: this.readingPack,
+    readingPackStale: this.readingPack
+      ? isReadingPackStale(this.readingPack, this.docRevision, this.docState.confirmed)
+      : false,
     canUndo: this.past.length > 0,
     canRedo: this.future.length > 0,
   });
@@ -374,6 +385,9 @@ export class AppStore {
     // 粘贴替换正文是全新文档，旧快照、问题基线与批注不再有对齐意义；规范用语规则是用户词表，予以保留
     this.snapshots = [];
     this.issueBaselines = [];
+    // 会话内临时产物（沙盒预演、引用阅读包）基于旧正文，新文档下一律清空
+    this.sandbox = null;
+    this.readingPack = null;
     this.commit({ doc, confirmed: {}, annotations: [], termRules: this.docState.termRules });
   }
 
@@ -526,6 +540,40 @@ export class AppStore {
     return true;
   }
 
+  // ---------- 引用阅读包（会话内临时产物：不持久化、不进入撤销历史） ----------
+
+  /**
+   * 以指定条款为起点生成引用阅读包：沿当前确认后的解析关系向目标方向
+   * 逐层收集直接 / 间接依赖条款。阅读包记录生成时的正文版本号与确认记录，
+   * 正文或歧义确认变化后失效，须重新生成。
+   */
+  generateReadingPack(articleId: string): { ok: boolean; error?: string } {
+    const built = buildReadingPack(
+      this.docState.doc,
+      this.analysis,
+      articleId,
+      this.docRevision,
+      this.docState.confirmed,
+    );
+    if ('error' in built) return { ok: false, error: built.error };
+    this.readingPack = built;
+    this.emit();
+    return { ok: true };
+  }
+
+  /** 正文或确认变化后按最新状态重新生成；起点已删除时返回失败 */
+  regenerateReadingPack(): { ok: boolean; error?: string } {
+    if (!this.readingPack) return { ok: false, error: '尚未生成阅读包' };
+    return this.generateReadingPack(this.readingPack.sourceId);
+  }
+
+  /** 清空当前阅读包（不影响正文与撤销历史） */
+  clearReadingPack(): void {
+    if (!this.readingPack) return;
+    this.readingPack = null;
+    this.emit();
+  }
+
   // ---------- 歧义确认 ----------
 
   confirmAmbiguous(signature: string, targetId: string): void {
@@ -642,6 +690,11 @@ export class AppStore {
   }
 
   // ---------- 派生查询 ----------
+
+  /** 当前正文版本号（仅正文内容变化时递增；供会话内临时产物做失效判定） */
+  getDocRevision(): number {
+    return this.docRevision;
+  }
 
   targetOfRef(refKey: string): string | null {
     const occ = this.analysis.occurrences.find((o) => o.key === refKey);
