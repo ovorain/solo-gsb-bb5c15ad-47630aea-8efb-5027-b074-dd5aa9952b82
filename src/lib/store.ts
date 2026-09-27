@@ -29,6 +29,11 @@ import {
   type SandboxOp,
   type SandboxPreview,
 } from './sandbox';
+import {
+  buildReadingPack,
+  isReadingPackStale,
+  type ReadingPack,
+} from './readingPack';
 import { localStore, serverStore } from './storage';
 import { createSnapshot, sanitizeSnapshots } from './snapshot';
 import { createIssueBaseline, sanitizeIssueBaselines } from './issueBaseline';
@@ -70,6 +75,8 @@ interface Snapshot {
   sandbox: SandboxPreview | null;
   /** 预演生成后正文或歧义确认记录已变化：预演失效，禁止应用 */
   sandboxStale: boolean;
+  /** 引用阅读包：当前会话生成的阅读包列表（最新在前；不持久化、不进入撤销历史） */
+  readingPacks: ReadingPack[];
   canUndo: boolean;
   canRedo: boolean;
 }
@@ -96,6 +103,8 @@ export class AppStore {
   lastTermReplace: { replaced: number; stale: number } | null = null;
   /** 修订沙盒：当前预演（会话内临时数据，不持久化、不进入撤销历史） */
   private sandbox: SandboxPreview | null = null;
+  /** 引用阅读包：会话内只读快照列表（正文 / 确认变化后标记失效，不删除旧包） */
+  private readingPacks: ReadingPack[] = [];
   /** 正文版本号：仅当正文文档对象变化时递增（批注 / 规范规则 / 歧义确认不变更正文） */
   private docRevision = 0;
 
@@ -132,6 +141,7 @@ export class AppStore {
     termHits: this.termHits,
     sandbox: this.sandbox,
     sandboxStale: this.sandbox ? this.isSandboxStale(this.sandbox) : false,
+    readingPacks: this.readingPacks,
     canUndo: this.past.length > 0,
     canRedo: this.future.length > 0,
   });
@@ -374,6 +384,9 @@ export class AppStore {
     // 粘贴替换正文是全新文档，旧快照、问题基线与批注不再有对齐意义；规范用语规则是用户词表，予以保留
     this.snapshots = [];
     this.issueBaselines = [];
+    // 会话内的修订预演与引用阅读包也按旧文档生成，替换文档后一并清空
+    this.sandbox = null;
+    this.readingPacks = [];
     this.commit({ doc, confirmed: {}, annotations: [], termRules: this.docState.termRules });
   }
 
@@ -395,6 +408,9 @@ export class AppStore {
     // 规范用语规则随 JSON 导入；旧文件缺少 termRules 时按空规则加载
     const termRules = sanitizeTermRules(bundle.termRules);
     renumberAll(doc.root);
+    // 导入的是另一份文档：会话内的修订预演与引用阅读包不再适用
+    this.sandbox = null;
+    this.readingPacks = [];
     this.commit({ doc: touch(doc), confirmed, annotations, termRules });
   }
 
@@ -415,6 +431,8 @@ export class AppStore {
   replaceWithSample(doc: ClauseDocument): void {
     this.snapshots = [];
     this.issueBaselines = [];
+    this.sandbox = null;
+    this.readingPacks = [];
     // 内置示例自带示例规则（见 sampleTermRules），同时保留用户已维护的词表
     this.commit({
       doc,
@@ -524,6 +542,44 @@ export class AppStore {
     this.sandbox = null;
     this.commit({ ...this.docState, doc: preview.resultDoc }, { structural: true });
     return true;
+  }
+
+  // ---------- 引用阅读包（会话内只读快照：不持久化、不进入撤销历史、不随 JSON 导出） ----------
+
+  /**
+   * 以指定条款为起点生成引用阅读包（沿当前已确认的引用关系向目标方向收集
+   * 直接 / 间接依赖条款）。阅读包冻结生成时刻的正文与确认签名；
+   * 正文或歧义确认变化后旧包标记失效，界面须重新生成，不能复制旧结果。
+   * 返回新阅读包 id；起点条款不存在时返回 null。
+   */
+  generateReadingPack(articleId: string): string | null {
+    const article = this.analysis.nodes[articleId];
+    if (!article || article.kind !== 'article') return null;
+    const pack = buildReadingPack(
+      this.analysis,
+      articleId,
+      this.docState.confirmed,
+      uid('rpk'),
+      this.docState.doc.updatedAt,
+      Date.now(),
+    );
+    this.readingPacks = [pack, ...this.readingPacks];
+    this.emit();
+    return pack.id;
+  }
+
+  /** 放弃指定阅读包（会话内临时数据，不影响正文与撤销历史） */
+  discardReadingPack(packId: string): void {
+    if (!this.readingPacks.some((p) => p.id === packId)) return;
+    this.readingPacks = this.readingPacks.filter((p) => p.id !== packId);
+    this.emit();
+  }
+
+  /** 阅读包失效判定：正文版本（doc.updatedAt）或歧义确认记录变化后旧包失效 */
+  isReadingPackCurrent(packId: string): boolean {
+    const pack = this.readingPacks.find((p) => p.id === packId);
+    if (!pack) return false;
+    return !isReadingPackStale(pack, this.docState.doc.updatedAt, this.docState.confirmed);
   }
 
   // ---------- 歧义确认 ----------

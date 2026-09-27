@@ -28,6 +28,11 @@ import {
 } from '../src/lib/issueBaseline';
 import { computeImpact } from '../src/lib/impact';
 import {
+  buildReadingPack,
+  isReadingPackStale,
+  renderReadingPackText,
+} from '../src/lib/readingPack';
+import {
   buildSandboxPreview,
   sandboxIssueJump,
   sandboxRewriteJump,
@@ -1440,6 +1445,264 @@ check('闭区间为每个目标建边', combA.edges.filter((e) => e.refKey === r
   const beforeJson = JSON.stringify(chainA);
   computeImpact(chainA, chainDoc.root[2].id);
   check('影响分析：计算不修改解析图', JSON.stringify(chainA) === beforeJson);
+}
+
+// ---- 引用阅读包：前向逐层收集、组合目标、汇合 / 循环去重、警示与纯文本 ----
+{
+  // 链式：一→二→三，起点第一条应收录全部三条，距离 0/1/2
+  const rpChainDoc = parseDocument(`阅读法
+
+第一条
+参见第二条。
+
+第二条
+参见第三条。
+
+第三条
+内容。`).doc;
+  renumberAll(rpChainDoc.root);
+  const rpChainA = analyze(rpChainDoc, { confirmed: {} });
+  const pack3 = buildReadingPack(rpChainA, rpChainDoc.root[0].id, {}, 'rpk1', rpChainDoc.updatedAt, 1);
+  check('阅读包：链式收录全部三条', pack3.entries.length === 3, String(pack3.entries.length));
+  check(
+    '阅读包：按原文档顺序收录',
+    pack3.entries.map((e) => e.articleId).join(','),
+    rpChainDoc.root.map((a) => a.id).join(','),
+  );
+  check(
+    '阅读包：起点/直接/间接距离',
+    pack3.entries.map((e) => e.distance).join(',') === '0,1,2',
+    pack3.entries.map((e) => e.distance).join(','),
+  );
+  check('阅读包：最远距离为 2', pack3.maxDistance === 2);
+  check('阅读包：冻结条款数', pack3.articles.length === 3);
+
+  // 起点第三条：无依赖，只收录起点
+  const packLeaf = buildReadingPack(rpChainA, rpChainDoc.root[2].id, {}, 'rpk2', rpChainDoc.updatedAt, 2);
+  check('阅读包：叶子条只收录起点', packLeaf.entries.length === 1 && packLeaf.entries[0].distance === 0);
+
+  // 组合引用：第二条、第三条及第四条 —— 每个已解析目标都参与收集
+  const rpListDoc = parseDocument(`组合阅读法
+
+第一条
+适用第二条、第三条及第四条的规定。
+
+第二条
+乙内容。
+
+第三条
+丙内容。
+
+第四条
+丁内容。`).doc;
+  renumberAll(rpListDoc.root);
+  const rpListA = analyze(rpListDoc, { confirmed: {} });
+  const packList = buildReadingPack(rpListA, rpListDoc.root[0].id, {}, 'rpk3', rpListDoc.updatedAt, 3);
+  check('阅读包：组合引用每个目标都参与收集', packList.entries.length === 4, String(packList.entries.length));
+  check(
+    '阅读包：组合目标按文档顺序',
+    packList.entries.slice(1).map((e) => e.articleId).join(','),
+    rpListDoc.root.slice(1).map((a) => a.id).join(','),
+  );
+
+  // 多路径汇合（菱形）：一→二、一→三；二→四、三→四。四只收录一次
+  const rpDiamondDoc = parseDocument(`菱形阅读法
+
+第一条
+参见第二条和第三条。
+
+第二条
+参见第四条。
+
+第三条
+参见第四条。
+
+第四条
+终点。`).doc;
+  renumberAll(rpDiamondDoc.root);
+  const rpDiamondA = analyze(rpDiamondDoc, { confirmed: {} });
+  const packD = buildReadingPack(rpDiamondA, rpDiamondDoc.root[0].id, {}, 'rpk4', rpDiamondDoc.updatedAt, 4);
+  check('阅读包：菱形汇合收录 4 条且四只一次', packD.entries.length === 4, String(packD.entries.length));
+  const fourEntry = packD.entries.find((e) => e.articleId === rpDiamondDoc.root[3].id)!;
+  check('阅读包：汇合点按最短距离（四在第 2 层）', fourEntry.distance === 2, String(fourEntry.distance));
+  check('阅读包：汇合重复路径计数 1', packD.dedupedPaths === 1, String(packD.dedupedPaths));
+
+  // 循环：一↔二互引，起点一收录两条且标注循环，循环边去重
+  const rpCycDoc = parseDocument(`循环阅读法
+
+第一条
+参见第二条。
+
+第二条
+参见第一条。`).doc;
+  renumberAll(rpCycDoc.root);
+  const rpCycA = analyze(rpCycDoc, { confirmed: {} });
+  const packC = buildReadingPack(rpCycA, rpCycDoc.root[0].id, {}, 'rpk5', rpCycDoc.updatedAt, 5);
+  check('阅读包：循环中收录 2 条且不重复', packC.entries.length === 2, String(packC.entries.length));
+  check('阅读包：循环条款标注', packC.entries.every((e) => e.inCycle));
+  check('阅读包：循环回边去重计数', packC.dedupedPaths === 1, String(packC.dedupedPaths));
+
+  // 条内自指边（绝对形式回指本条）不构成条款间依赖
+  const rpSelfDoc = parseDocument(`自指阅读法
+
+第五条
+按第五条执行。
+
+第六条
+参见第五条。`).doc;
+  rpSelfDoc.root[0].ordinal = 5;
+  rpSelfDoc.root[1].ordinal = 6;
+  const rpSelfA = analyze(rpSelfDoc, { confirmed: {} });
+  const packSelf = buildReadingPack(rpSelfA, rpSelfDoc.root[1].id, {}, 'rpk6', rpSelfDoc.updatedAt, 6);
+  check('阅读包：条内自指不产生额外依赖', packSelf.entries.length === 2, String(packSelf.entries.length));
+
+  // 断链与未确认歧义进入警示；已确认歧义不再列为警示且参与收集
+  // 显式保留“同序号 + 之一后缀”结构（renumberAll 会重排序号，不能用于歧义构造）
+  const rpWarnDoc = parseDocument(`警示阅读法
+
+第一条
+参见第二十条。
+
+第二条
+参见第八条。
+
+第八条
+原文。
+
+第八条之一
+后缀条。`).doc;
+  rpWarnDoc.root[0].ordinal = 1;
+  rpWarnDoc.root[1].ordinal = 2;
+  rpWarnDoc.root[2].ordinal = 8;
+  rpWarnDoc.root[3].ordinal = 8;
+  rpWarnDoc.root[3].suffix = '一';
+  const rpWarnA0 = analyze(rpWarnDoc, { confirmed: {} });
+  const packW = buildReadingPack(rpWarnA0, rpWarnDoc.root[0].id, {}, 'rpk7', rpWarnDoc.updatedAt, 7);
+  // 第一条断链（第二十条不存在）→ 只有起点被收录，警示 1 条断链
+  check('阅读包：起点条 1 条', packW.entries.length === 1, String(packW.entries.length));
+  check('阅读包：断链进入警示', packW.warnings.some((w) => w.kind === 'broken' && w.raw === '第二十条'), JSON.stringify(packW.warnings));
+  const brokenW = packW.warnings.find((w) => w.raw === '第二十条')!;
+  check('阅读包：警示带来源节点', brokenW.sourceNodeId === rpWarnDoc.root[0].children[0].id);
+  check('阅读包：警示带原因', brokenW.reason.length > 0, brokenW.reason);
+
+  // 歧义：第二条引用“第八条”（同时存在第八条之一）未确认 → 歧义警示
+  const packAmb = buildReadingPack(rpWarnA0, rpWarnDoc.root[1].id, {}, 'rpk8', rpWarnDoc.updatedAt, 8);
+  check(
+    '阅读包：未确认歧义进入警示且不沿候选展开',
+    packAmb.warnings.some((w) => w.kind === 'ambiguous' && w.raw === '第八条') && packAmb.entries.length === 1,
+    JSON.stringify(packAmb.warnings),
+  );
+
+  // 确认歧义后：警示消失，并沿确认目标收集（第八条被收录）
+  const ambOcc = rpWarnA0.occurrences.find(
+    (o) => o.nodeId === rpWarnDoc.root[1].children[0].id && o.span.raw === '第八条',
+  )!;
+  const rpWarnA1 = analyze(rpWarnDoc, { confirmed: { [ambOcc.signature]: rpWarnDoc.root[2].id } });
+  const packAmbConf = buildReadingPack(
+    rpWarnA1,
+    rpWarnDoc.root[1].id,
+    { [ambOcc.signature]: rpWarnDoc.root[2].id },
+    'rpk9',
+    rpWarnDoc.updatedAt,
+    9,
+  );
+  check('阅读包：确认后歧义警示消失', packAmbConf.warnings.length === 0, JSON.stringify(packAmbConf.warnings));
+  check(
+    '阅读包：确认目标参与收集',
+    packAmbConf.entries.some((e) => e.articleId === rpWarnDoc.root[2].id) && packAmbConf.entries.length === 2,
+    String(packAmbConf.entries.length),
+  );
+
+  // 组合引用部分缺失：已解析目标参与收集，缺失成员进入警示
+  const rpPartialDoc = parseDocument(`部分缺失阅读法
+
+第一条
+适用第二条、第三条及第九条。
+
+第二条
+乙。
+
+第三条
+丙。`).doc;
+  renumberAll(rpPartialDoc.root);
+  const rpPartialA = analyze(rpPartialDoc, { confirmed: {} });
+  const packPartial = buildReadingPack(rpPartialA, rpPartialDoc.root[0].id, {}, 'rpk10', rpPartialDoc.updatedAt, 10);
+  check(
+    '阅读包：部分缺失时已解析目标仍收录',
+    packPartial.entries.length === 3 &&
+      packPartial.entries.some((e) => e.articleId === rpPartialDoc.root[1].id) &&
+      packPartial.entries.some((e) => e.articleId === rpPartialDoc.root[2].id),
+    String(packPartial.entries.length),
+  );
+  check('阅读包：组合缺失成员进入断链警示', packPartial.warnings.some((w) => w.kind === 'broken' && w.raw.includes('第九条')), JSON.stringify(packPartial.warnings.map((w) => w.raw)));
+
+  // 冻结副本与活动文档脱离引用关系
+  const mutDoc = JSON.parse(JSON.stringify(rpChainDoc)) as typeof rpChainDoc;
+  const mutA = analyze(mutDoc, { confirmed: {} });
+  const packFrozen = buildReadingPack(mutA, mutDoc.root[0].id, {}, 'rpk11', mutDoc.updatedAt, 11);
+  mutDoc.root[0].children[0].text = '被改写后的正文';
+  check(
+    '阅读包：冻结副本不随后续修改变化',
+    packFrozen.articles[0].children[0].text === '参见第二条。',
+    packFrozen.articles[0].children[0].text,
+  );
+
+  // 失效判定：正文版本变化 / 歧义确认变化
+  check('阅读包：生成时为最新', isReadingPackStale(packFrozen, mutDoc.updatedAt, {}) === false);
+  check('阅读包：正文版本变化后失效', isReadingPackStale(packFrozen, mutDoc.updatedAt + 1, {}) === true);
+  check(
+    '阅读包：歧义确认变化后失效',
+    isReadingPackStale(packFrozen, mutDoc.updatedAt, { 'sig::x': 'art1' }) === true,
+  );
+
+  // 纯文本渲染：保留原编号与正文，含起点、条款与警示节
+  const text = renderReadingPackText(packPartial);
+  check('阅读包：纯文本含标题与起点', text.startsWith('【引用阅读包】') && text.includes('第一条'));
+  check('阅读包：纯文本含完整条款原文', text.includes('乙。') && text.includes('丙。'));
+  check('阅读包：纯文本含款/项编号', (() => {
+    const itemDoc = parseDocument(`款项阅读法
+
+第一条
+第一款如下：
+（一）第一项内容。`).doc;
+    renumberAll(itemDoc.root);
+    const itemA = analyze(itemDoc, { confirmed: {} });
+    const itemPack = buildReadingPack(itemA, itemDoc.root[0].id, {}, 'rpk12', itemDoc.updatedAt, 12);
+    const itemText = renderReadingPackText(itemPack);
+    return itemText.includes('第一款') && itemText.includes('（一）') && itemText.includes('第一项内容。');
+  })());
+  check('阅读包：纯文本含警示节', text.includes('【断链 / 歧义引用警示】') && text.includes('第九条'));
+
+  // 纯计算：生成阅读包不修改解析图
+  const beforeRpJson = JSON.stringify(rpChainA);
+  buildReadingPack(rpChainA, rpChainDoc.root[0].id, {}, 'rpk13', rpChainDoc.updatedAt, 13);
+  check('阅读包：计算不修改解析图', JSON.stringify(rpChainA) === beforeRpJson);
+
+  // store 集成：生成 / 失效 / 放弃 / 导入清空
+  {
+    const store = new AppStore({ doc: JSON.parse(JSON.stringify(rpChainDoc)), confirmed: {}, annotations: [] });
+    const id = store.generateReadingPack(rpChainDoc.root[0].id);
+    check('阅读包：store 生成成功', typeof id === 'string' && store.getSnapshot().readingPacks.length === 1);
+    check('阅读包：store 起点非法返回 null', store.generateReadingPack('art_none') === null);
+    check('阅读包：刚生成时为最新', store.isReadingPackCurrent(id!) === true);
+    // 编辑正文后旧包失效
+    store.updateNodeText(rpChainDoc.root[2].children[0].id, '内容已修改。');
+    check('阅读包：正文变化后旧包失效', store.isReadingPackCurrent(id!) === false);
+    // 重新生成后为最新
+    const id2 = store.generateReadingPack(rpChainDoc.root[0].id);
+    check('阅读包：重新生成后为最新', store.isReadingPackCurrent(id2!) === true);
+    // 放弃
+    store.discardReadingPack(id2!);
+    check('阅读包：放弃后移除', !store.getSnapshot().readingPacks.some((p) => p.id === id2));
+    // 阅读包不进入撤销历史
+    const beforeUndo = store.getSnapshot().canUndo;
+    const id3 = store.generateReadingPack(rpChainDoc.root[0].id);
+    void id3;
+    check('阅读包：生成不进入撤销历史', store.getSnapshot().canUndo === beforeUndo);
+    // 导入新文档清空阅读包
+    store.importPastedText('全新法\n第一条\n无引用。');
+    check('阅读包：导入新文档后清空', store.getSnapshot().readingPacks.length === 0);
+  }
 }
 
 // ---- 修订沙盒：条级删除 / 移位 / 换号的预演、失效与一步应用 ----

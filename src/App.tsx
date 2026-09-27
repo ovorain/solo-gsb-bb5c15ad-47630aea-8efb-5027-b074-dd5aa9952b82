@@ -10,11 +10,12 @@ import { TermPanel } from './components/TermPanel';
 import { RelationView } from './components/RelationView';
 import { CompareView } from './components/CompareView';
 import { SandboxPanel } from './components/SandboxPanel';
+import { ReadingPackPanel } from './components/ReadingPackPanel';
 import { ImportDialog } from './components/ImportDialog';
 import { ToastHost } from './components/Toast';
 
 type ViewMode = 'edit' | 'compare';
-type SideTab = 'issues' | 'annotations' | 'terms' | 'graph' | 'sandbox';
+type SideTab = 'issues' | 'annotations' | 'terms' | 'graph' | 'sandbox' | 'reading';
 
 export default function App({
   store,
@@ -141,6 +142,14 @@ export default function App({
                 >
                   修订沙盒
                 </button>
+                <button
+                  role="tab"
+                  aria-selected={rightTab === 'reading'}
+                  className={rightTab === 'reading' ? 'active' : ''}
+                  onClick={() => setRightTab('reading')}
+                >
+                  引用阅读
+                </button>
               </div>
               {rightTab === 'issues' ? (
                 <IssuePanel />
@@ -156,6 +165,8 @@ export default function App({
                 />
               ) : rightTab === 'graph' ? (
                 <RelationView />
+              ) : rightTab === 'reading' ? (
+                <ReadingPackPanel />
               ) : (
                 <SandboxPanel />
               )}
